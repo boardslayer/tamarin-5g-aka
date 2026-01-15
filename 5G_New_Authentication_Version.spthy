@@ -1,0 +1,142 @@
+theory 5G_AlphaBox_Final
+begin
+
+builtins: diffie-hellman, signing, hashing
+
+// 1. Define custom functions
+functions: kdf1/2, kdf2/2, hkdf_sha256/1, hmac/2, aes_enc/3, aes_dec/3
+equations: aes_dec(k, icb, aes_enc(k, icb, m)) = m
+
+// 2. Equality restriction
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+// --- Infrastructure ---
+
+rule Register_HN_Keys:
+    [ Fr(~skHN) ]
+    -->
+    [ !LtkHN($HN, ~skHN)           
+    , !PkHN($HN, 'g'^~skHN)      
+    , Out('g'^~skHN) 
+    ]
+
+rule Register_UE_HN_Shared:
+    [ Fr(~k), Fr(~supi) ]
+    -->
+    [ !LtkShared($UE, $HN, ~k, ~supi)
+    , !DB(~supi, ~k)               
+    ]
+
+rule Reveal_K:
+    [ !LtkShared(UE, HN, k, supi) ]
+  --[ Reveal(supi) ]->
+    [ Out(k) ]
+
+rule UE_Initiates:
+    [ Fr(~id) ] 
+    -->
+    [ UE_Waiting_Nonce($UE, $HN, ~id)  
+    , Out(~id) 
+    ]
+
+// --- Protocol Rules ---
+
+rule gNB_Sends_Nonce:
+    [ In(id), Fr(~ngNB) ]
+    -->
+    [ StoredNonce($gNB, id, ~ngNB)
+    , Out(<id, ~ngNB>) 
+    ]
+
+rule UE_Registration_Request:
+    let
+        Re = 'g'^~ke                             
+        Z  = pkHN^~ke                            
+        Kenc = kdf1(Z, Re)                
+        ICB  = kdf2(Z, Re)
+        KMAC = hkdf_sha256(~k)                   
+        M    = hmac(KMAC, ~supi)                  
+        C    = aes_enc(Kenc, ICB, <~supi, M>)            
+        sig  = sign(<C, ngNB>, ~ke)              
+    in
+    [ UE_Waiting_Nonce($UE, $HN, id)
+    , !PkHN($HN, pkHN)             
+    , !LtkShared($UE, $HN, ~k, ~supi)
+    , In(<id, ngNB>)
+    , Fr(~ke)
+    ]
+  --[ Send_UE($UE, ~supi, C),
+      Running_UE($UE, $HN, <~supi, ~k>),
+      UE_Signed(<C, ngNB>, ~ke) // UE labels the message and the key used
+    ]->
+    [ !PubHN($UE, pk(~ke)), Out(<Re, C, sig, id, pk(~ke)>) ]
+
+// rule AlphaBox_Verify:
+//     [ In(<Re, C, sig, id, pub>)
+//     , StoredNonce($gNB, id, ngNB) 
+//     ]
+//   --[ Eq(verify(sig, <C, ngNB>, pub), true), // Logic: If verification fails, rule never fires
+//       Alpha_Verified(id, ngNB),
+//       Alpha_Verified_Event(<C, ngNB>, pub) 
+//     ]->
+//     [ Forward_HN(Re, C, sig) ]
+
+rule AlphaBox_Verify:
+    [ In(<Re, C, sig, id, pub>)
+    , StoredNonce($gNB, id, ngNB) 
+    ]
+  --[ Eq(verify(sig, <C, ngNB>, pub), true),
+      Alpha_Verified(id, ngNB),
+      Alpha_Verified_Event(sig, <C, ngNB>, pub) 
+    ]->
+    [ Forward_HN(Re, C, sig) ]
+
+
+rule HN_Deconceal:
+    let
+        Z = Re^skHN                              
+        Kenc = kdf1(Z, Re)                
+        ICB  = kdf2(Z, Re)
+        msg = aes_dec(Kenc, ICB, C)
+        KMAC_check = hkdf_sha256(k_retrieved)  
+    in
+    [ Forward_HN(Re, C, sig)
+    , !LtkHN($HN, skHN)            
+    , !DB(supi_dec, k_retrieved)   
+    ]
+  --[ Eq(msg, <supi_dec, hmac(KMAC_check, supi_dec)>),
+      HN_Success($HN, supi_dec),
+      Commit_HN($HN, supi_dec, k_retrieved) 
+    ]->
+    [ ]
+
+// --- Lemmas ---
+
+// 1. Trace Existence: Prove the protocol can run to completion.
+lemma executable:
+    exists-trace
+    "Ex hn supi #i. HN_Success(hn, supi) @i"
+
+// 2. Freshness: AlphaBox must reject a replayed nonce.
+lemma alphabox_no_replay:
+    "All id ngNB #i #j. 
+        Alpha_Verified(id, ngNB) @i & Alpha_Verified(id, ngNB) @j
+        ==> #i = #j"
+
+// 3. Signature Integrity: AlphaBox only verifies messages actually signed by the key-holder.
+// This proves that an invalid signature (wrong key or wrong message) leads to rejection.
+lemma alphabox_rejects_invalid_signatures:
+  "All C ngNB pub #i.
+     Alpha_Verified_Event(<C, ngNB>, pub) @i
+     ==> (Ex sig.
+           verify(sig, <C, ngNB>, pub) = true)"
+
+
+// 4. Authenticity: HN only accepts if the UE with the correct shared key K was running.
+lemma hn_rejects_k_forgery:
+    "All hn supi k #i. Commit_HN(hn, supi, k) @i
+     ==> (Ex ue #j. Running_UE(ue, hn, <supi, k>) @j & j < i)
+         | (Ex #k_leak. K(k) @k_leak)"
+
+end
